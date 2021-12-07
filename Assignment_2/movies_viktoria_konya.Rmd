@@ -1,0 +1,216 @@
+---
+title: "Assignment 2"
+subtitle: "Web scraping class"
+author: "Viktória Kónya"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+
+  prettydoc::html_pretty:
+    highlight: github
+    toc: true
+    theme: cayman
+
+---
+
+**The Movie Database (TMDb) API Documentation** : https://developers.themoviedb.org/3/getting-started/introduction
+
+```{r warning = F, message = F, echo = F}
+
+# Import packages
+library(rvest)
+library(data.table)
+library(jsonlite)
+library(httr)
+library(ggplot2)
+library(tidyverse)
+library(kableExtra)
+
+```
+
+```{r global_options, echo = FALSE, include = FALSE}
+options(width = 999)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE,
+                      cache = FALSE, tidy = FALSE, size = "small")
+```
+
+### Import file with TMDb movie_ids
+In order to make GET requests, the movie_id of the movies is needed. 
+The list of all movie_ids can be downloaded from the TMDB API site in a zipped file. I unzipped and added this JSON file to my GitHub repo, made a subset of that and I will call it from my GitHub.
+
+See desciption here: https://developers.themoviedb.org/3/getting-started/daily-file-exports
+
+```{r, echo = F}
+# DO NOT EXECUTE THIS !!!
+# movie_ids <- stream_in(file("https://raw.githubusercontent.com/viktoriakonya/ECBS-5306-Coding-2-Web-Scraping-with-R/master/Assignment_2/data/movie_ids_11_16_2021_downloaded.json"))
+# movie_ids <- movie_ids %>% arrange(desc(popularity)) 
+# movie_ids_short <- movie_ids %>% head(100)
+# stream_out(movie_ids_short, file("movie_ids_short.json"))
+```
+
+### Import JSON file with movie_ids
+```{r, error = F, warning = F, messages = F}
+
+movie_ids_short <- stream_in(file("https://raw.githubusercontent.com/viktoriakonya/ECBS-5306-Coding-2-Web-Scraping-with-R/master/Assignment_2/data/movie_ids_short.json"))
+
+kable(head(movie_ids_short)) %>%
+  kable_styling(full_width = F, font_size = 11)
+```
+
+
+### GET APIs of 100 movies
+```{r}
+
+
+# Get APIs
+get_api <- function(url) {
+  
+  t <- GET(url)
+  t <- fromJSON(content(t, "text"))
+  
+  # ID
+  id <- t$id
+  
+  # Production companies
+  production_companies <- paste0(t$production_companies$name, collapse = ", ")
+  
+  # Budget
+  runtime <- t$runtime
+  
+  # Genres
+  genres <- paste0(t$genres$name, collapse = ", ")
+
+  # Title
+  title <- t$original_title
+  
+  # Overview
+  overview <- t$overview
+  
+  # Budget
+  budget <- t$budget
+  
+  # Revenue
+  revenue <- t$revenue
+  
+  # Popularity
+  popularity <- t$popularity
+  
+  # Vote Average
+  vote_average <- t$vote_average
+  
+  # Vote Count
+  vote_count <- t$vote_count
+  
+  # Df
+  df <- data.frame(id, 
+                   title, 
+                   production_companies, 
+                   runtime, budget, 
+                   revenue, 
+                   popularity, 
+                   vote_average, 
+                   vote_count, 
+                   overview)
+  
+  colnames(df) <- c("ID", 
+                    "Title", 
+                    "Production companies",  
+                    "Runtime", 
+                    "Budget", 
+                    "Revenue",
+                    "Popularity", 
+                    "Vote Average", 
+                    "Vote Count", 
+                    "Overview")
+  
+  return(df)
+  
+}
+
+# Define API key and movie_id list
+api_key <- '1858116a97594edd8c00b69df8d51d3f'
+movie_ids <- movie_ids_short$id
+
+# Concatenate links
+links <- paste0("https://api.themoviedb.org/3/movie/",movie_ids,"?api_key=", api_key)
+
+# Create Df
+list_of_dfs <- lapply(links, get_api)
+list_of_dfs_appended <- rbindlist(list_of_dfs)
+
+kable(head(list_of_dfs_appended)) %>%
+  kable_styling(font_size = 11) 
+
+```
+
+### Visualizations
+
+#### Distribution of movie runtimes
+```{r, echo = F}
+
+list_of_dfs_appended %>%
+ filter(Runtime > 0) %>%
+ ggplot() +
+ aes(x = Runtime) +
+ geom_density(adjust = 1, fill = "#41ab5d", alpha = 0.8) +
+  labs(title = "Distribution of movie runtimes", y = "Density", x = "Runtime") +
+ theme_bw() +
+ theme(
+    plot.title = element_text(size = 14L,
+    face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+```
+
+#### Top 10 movies with highest revenues
+```{r, echo = F}
+
+list_of_dfs_appended %>% 
+  arrange(desc(Revenue)) %>% 
+  mutate(Revenue_MM = Revenue / 1000000 )  %>% 
+  head(10) %>% 
+  ggplot() +
+  aes(x = reorder(Title, Revenue_MM), weight = Revenue_MM ) +
+  scale_fill_viridis_c(begin = 0.2, end = 0.7) +
+  geom_bar( aes(fill = -Revenue_MM)) +
+  labs(title = "Top 10 movies with highest revenues", y = "Revenue (million $)", x = NULL) +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14L,
+    face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+```
+
+#### Relationship between vote count and average vote
+```{r, echo = F}
+list_of_dfs_appended %>% 
+  filter(`Vote Count` >= 200) %>% 
+  filter(`Vote Average` >= 5) %>% 
+  ggplot() +
+  aes(
+    x = `Vote Count`,
+    y = `Vote Average`,
+    colour = `Vote Average`
+  ) +
+  geom_point(shape = "circle", size = 1.5) +
+  geom_smooth(method='lm', se = F, color = 'gray20') +
+  scale_color_viridis_c(option = "viridis", direction = -1, begin = 0.2, end = 0.8) +
+  labs(title = "Relationship between vote count and average vote") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14L,
+    face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+```
+
