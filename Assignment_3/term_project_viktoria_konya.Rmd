@@ -1,0 +1,837 @@
+---
+title: "Term Project"
+subtitle: "Web scraping class"
+author: "Viktória Kónya"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+geometry: margin=2cm
+fontsize: 9pt
+output:
+
+  prettydoc::html_pretty:
+    highlight: github
+    toc: true
+    theme: cayman
+
+---
+
+
+## Introduction
+
+In this report my goal is to analyze the top US universities focusing on the gender distribution, tuition fees and starting salaries that student can expect after graduation. The data of the universities was scraped from the usnews.com website's university ranking page and was combined with more detailed information from each university's subpage.The collected data was cleaned and visualizations were created in order to summarize the most important findings from the dataset.
+
+
+**Best US Universities ranking** : https://www.usnews.com/best-colleges/rankings/national-universities
+
+```{r warning = F, message = F, echo = F}
+
+# Clear environment
+rm(list=ls())
+
+# Import libraries
+library(tidyverse)
+require(httr)
+library(stringr)
+library(rvest)
+library(jsonlite)
+library(xml2)
+library(data.table)
+library(ggplot2)
+library(tryCatchLog)
+library(gridExtra)
+library(kableExtra)
+library(cowplot)
+
+```
+```{r global_options, echo = FALSE, include = FALSE}
+options(width = 999)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE,
+                      cache = FALSE, tidy = FALSE, size = "small")
+```
+
+
+## Collecting the list of the university URLs using the websites API
+
+In order to gather information from each university's subpage on www.usnews.com, the list of URLs of the subpages needed to be extracted first from the university ranking page. Fortunately, after some research I found that the website provides API for the university rankings data so I requested the basic information of the universities using the website's API. The API request can be done as seen below where the only changing parameter is the page number. Each returned JSON file contained the basic information from the rankings page of 10 universities. From the first JSON I could extract the total number of pages (max_iter) that I later used to iterate through all the pages (in total there were 392 universities, so I needed to make the request 40 times).
+
+```{r, error = F, warning = F, messages = F}
+
+# Use the page's API to get the number of pages
+df <- fromJSON('https://www.usnews.com/best-colleges/api/search?_sort=rank&_sortDirection=asc&_page=1&schoolType=national-universities')
+max_iter <- df$data$totalPages # Number of pages
+
+```
+
+Once I had the total number of pages, I could gather the basic university data with API requests. The difficulty that I faced was that the tuition fee information on the rankings site was stored differently in case of public and private universities. Public universities apply two different tuition fee schemes: out-of-state and in-state tuition fees while private schools have only one tuition fee. The two kinds of tuition fee information was stored in different places in the JSON string and for private schools this depth of information was not even available in the hierarchy. As the execution dropped for private schools I needed to add an error handling condition with `tryCatch`. 
+
+```{r, error = F, warning = F, messages = F}
+
+# Define base URL  
+base <- "https://www.usnews.com"
+
+# Create empty data frame for links and basic information
+data <- data.frame(university_name = character(), 
+                   university_rank = character(), 
+                   university_primary_key = integer(),
+                   state = character(),
+                   city = character(),
+                   zip = integer (),
+                   link = character(),
+                   tuition = character(),
+                   tuition_in_out_of_state = character(),
+                   undergrad_enrollment = character())
+
+
+# Get all links and basic information
+for (i in 1:max_iter) {
+  
+  # Get each page with API
+  df <- fromJSON(paste0('https://www.usnews.com/best-colleges/api/search?_sort=rank&_sortDirection=asc&_page=', i ,'&schoolType=national-universities'))
+  
+  # Get links
+  links <- df$data$items$institution$linkedDisplayName
+  links <- gsub("\"", "", sub(">.*", "", gsub("<strong><a class=\"black90\" href=", "", links, fixed=TRUE)))
+  
+  # Out of and in state tuition fees
+  tuition <- data.frame(tuition_in_out_of_state = character())
+  
+  for (j in 1:length(df$data$items$institution$linkedDisplayName)) {
+    
+    if(tryCatch(df[["data"]][["items"]][["searchData"]][["tuition"]][["displayValue"]][[j]][["value"]], error = function(e) FALSE) == FALSE){
+      tuition_j <- NA
+    }else{
+      tuition_j <- paste0(df[["data"]][["items"]][["searchData"]][["tuition"]][["displayValue"]][[j]][["value"]], collapse = ", ")
+    }
+    
+    tuition <- rbind(tuition, tuition_j)
+    colnames(tuition) <- c("tuition_in_out_of_state")
+    }
+  
+  # Insert into dataframe
+  data_i <- data.frame(cbind(
+              university_name = df$data$items$institution$displayName,
+              university_rank = df$data$items$ranking$displayRank,
+              university_primary_key = df$data$items$institution$primaryKey,
+              state = df$data$items$institution$state,
+              city = df$data$items$institution$city,
+              zip = df$data$items$institution$zip,
+              link = paste0(base, links),
+              tuition = df$data$items$searchData$tuition$rawValue,
+              tuition_in_out_of_state = tuition,
+              undergrad_enrollment = df$data$items$searchData$enrollment$rawValue
+              ))
+  
+  # Append to main dataset
+  data <- rbind(data, data_i)
+
+}
+
+
+# Save dataset for future use
+saveRDS(data, file = "raw/university_base.rds")
+
+# Remove datasets 
+rm(list = c('data_i','df', 'max_iter', 'base', 'i', 'links', 'j', 'tuition', 'tuition_j'))
+
+```
+
+
+Let's take a look at the dataset:
+```{r, echo = F, error = F, warning = F, messages = F}
+
+kable(head(data)) %>%
+  kable_styling(font_size = 11, full_width = F) %>%
+  scroll_box(width = "900px")
+
+```
+So now we have all the URLs of the university subpages and can start to collect more detailed information about the universities.
+
+
+
+## Downloading and saving all HTMLs
+
+The next step was that I had to iterate through all the scraped URLs and get the information from the universities' subpages. The difficulty that I had here was that the HTMLs could not be read with the read_html() function in RStudio (it was running forever but never returned the HTML content). So, the solution I found was that I executed the HTML download part of the code in the base R console and saved all the downloaded HTMLs to my working directory. I commented out this part of the code intentionally (it was executed in R).
+
+```{r, error = F, warning = F, messages = F}
+
+# Execute the download in R console
+
+#get_one_page <- function(url, name) {
+
+   # Get link
+   #t <- read_html(url)
+
+   # Save HTML to working directory
+   #(t, paste0(name, '.html'))
+
+ #}
+
+# Execute for all pages
+#mapply(get_one_page, data$link , data$university_primary_key)
+
+```
+
+
+
+## Collecting data from university subpages
+
+Once I had all the university HTMLs downloaded, I could start to extract the necessary information from the pages. As the JSON had very complex structure I found that the easiest way to identify the node IDs is by using the XPath syntax. From the university subpages I downloaded the content of the summary table as well as information about the median starting salaries, university admission and graduation statistics, class size and gender distribution of the institutions. The difficulty I had here was that the HTML pages were not exactly identical for each university so I needed to add if-else conditions to manage the empty nodes and collect the information for all universities. 
+
+```{r, error = F, warning = F, messages = F}
+
+get_university_data <- function(html) {
+  
+  ### Primary key
+  university_primary_key <- gsub("\\..*", "", html) 
+  
+  ### Import html
+  html_i <- read_html(html)
+  
+  ### General information part 
+  
+  # Description
+  description <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/section[1]/div[1]/div[2]/p') %>%
+    html_text()
+  
+  # School type
+  school_type <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/section[1]/react-trigger/div/div[1]/div[1]/div[1]/p[2]') %>%
+    html_text()
+  
+  # Year founded
+  year_founded <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/section[1]/react-trigger/div/div[1]/div[1]/div[2]/p[2]') %>%
+    html_text()
+  
+  # Religious Affiliation
+  religious_affiliation <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/section[1]/react-trigger/div/div[1]/div[1]/div[3]/p[2]') %>%
+    html_text()
+  
+  # Academic calendar
+  academic_calendar <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/section[1]/react-trigger/div/div[1]/div[1]/div[4]/p[2]') %>%
+    html_text()
+  
+  # Setting
+  setting <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/section[1]/react-trigger/div/div[1]/div[1]/div[5]/p[2]') %>%
+    html_text()
+  
+  # Phone
+  phone <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/section[1]/react-trigger/div/div[1]/div[1]/div[6]/p[2]') %>%
+    html_text()
+  
+  # Website
+  school_website <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/section[1]/react-trigger/div/div[1]/div[1]/div[7]/a') %>%
+    html_attr('href')
+  
+  
+  
+  ### Median Starting Salary
+  
+  median_starting_salary_pre <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/react-trigger[2]/section/div[2]/div[1]/p/a') 
+  median_starting_salary_pre2 <- html_i %>% 
+    html_nodes(xpath = '//*[@id="app"]/div/div[3]/div[5]/div/div[1]/div/div/react-trigger[3]/section/div[2]/div[1]/p/a') 
+  
+  if(length(sub(".*>(.*)<.*","\\1",median_starting_salary_pre))>0) {
+    median_starting_salary <- sub(".*>(.*)<.*","\\1",median_starting_salary_pre)
+  }else{
+    median_starting_salary <- sub(".*>(.*)<.*","\\1",median_starting_salary_pre2)
+  }
+  
+  
+  ### Admissions part
+  
+  # Admission description
+  admission_description <- html_i %>% 
+    html_nodes(xpath = '//*[@id="admissions"]/div[1]/div/p[2]') %>%
+    html_text()
+  
+  # Selectivity
+  selectivity <- html_i %>% 
+    html_nodes(xpath = '//*[@id="admissions"]/div[2]/div[1]/p[2]/a') %>%
+    html_text()
+  
+  # Acceptence rate
+  if(length(html_i %>%
+            html_nodes(xpath = '//*[@id="admissions"]/div[2]/div[2]/p[2]/a') %>%
+            html_text())>0) {
+    acceptance_rate <- html_i %>%
+      html_nodes(xpath = '//*[@id="admissions"]/div[2]/div[2]/p[2]/a') %>%
+      html_text()
+  }else{
+    acceptance_rate <- html_i %>%
+      html_nodes(xpath = '//*[@id="admissions"]/div[2]/div[2]/p/a') %>%
+      html_text()
+  }
+  
+  # Application deadline
+  application_deadline <- html_i %>% 
+    html_nodes(xpath = '//*[@id="admissions"]/div[2]/div[3]/p[2]/a') %>%
+    html_text()
+  
+  
+  
+  ### Class size
+  
+  # Classes with fewer than 20 students - else N/A
+  if(length( html_i %>%
+             html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[1]/div[2]/div/div[1]/b') %>%
+             html_text())>0) {
+    class_size_20 <- html_i %>%
+      html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[1]/div[2]/div/div[1]/b') %>%
+      html_text()
+  }else{
+    class_size_20 <- NA
+  }
+  
+  # Classes with fewer than 20-49 students - else N/A
+  if(length( html_i %>%
+             html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[1]/div[2]/div/div[2]/b') %>%
+             html_text())>0) {
+    class_size_20_49 <- html_i %>%
+      html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[1]/div[2]/div/div[2]/b') %>%
+      html_text()
+  }else{
+    class_size_20_49 <- NA
+  }
+  
+  # Classes with fewer than 50+ students - else N/A
+  if(length( html_i %>%
+             html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[1]/div[2]/div/div[3]/b') %>%
+             html_text())>0) {
+    class_size_50 <- html_i %>%
+      html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[1]/div[2]/div/div[3]/b') %>%
+      html_text()
+  }else{
+    class_size_50 <- NA
+  }
+  
+  # Student - faculty ratio
+  if(length( html_i %>%
+             html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[1]/p[2]') %>%
+             html_text())>0) {
+    student_faculty_ratio <- html_i %>%
+      html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[1]/p[2]') %>%
+      html_text()
+  }else if(
+    length(html_i %>%
+           html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[2]/p[2]/a') %>%
+           html_text())>0) {
+    student_faculty_ratio <- html_i %>%
+      html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[2]/p[2]/a') %>%
+      html_text()
+  }else{
+    student_faculty_ratio <- html_i %>%
+      html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[2]/p/a') %>%
+      html_text()
+  }
+  
+  
+  
+  ### Graduation rate
+  
+  graduation_rate <- html_i %>% 
+    html_nodes(xpath = '//*[@id="academic-life"]/div[2]/div[3]/p[2]/a') %>%
+    html_text()
+  
+  
+  
+  ### Student life part 
+  
+  # Male percentage
+  if(length(  html_i %>% 
+              html_nodes(xpath = '//*[@id="student-life"]/div[2]/div[1]/div[2]/div/div[1]/b') %>%
+              html_text())>0) {
+    male <- html_i %>% 
+      html_nodes(xpath = '//*[@id="student-life"]/div[2]/div[1]/div[2]/div/div[1]/b') %>%
+      html_text()
+  }else{
+    male <- 'N/A'
+  }
+  
+  # Female percentage
+  if(length(  html_i %>% 
+              html_nodes(xpath = '//*[@id="student-life"]/div[2]/div[1]/div[2]/div/div[2]/b') %>%
+              html_text())>0) {
+    female <- html_i %>% 
+      html_nodes(xpath = '//*[@id="student-life"]/div[2]/div[1]/div[2]/div/div[2]/b') %>%
+      html_text()
+  }else{
+    female <- NA
+  }
+  
+
+  
+  ### Create dataframe
+  
+  uni_data <- data.frame(
+    university_primary_key,
+    description, 
+    school_type ,
+    year_founded ,
+    religious_affiliation ,
+    academic_calendar ,
+    setting ,
+    phone ,
+    school_website ,
+    median_starting_salary ,
+    admission_description ,
+    selectivity ,
+    acceptance_rate ,
+    application_deadline ,
+    class_size_20 , 
+    class_size_20_49 , 
+    class_size_50 , 
+    student_faculty_ratio ,
+    graduation_rate ,
+    male ,
+    female 
+  )
+  
+  return(uni_data)
+  
+}
+
+
+# Append list of htmls
+htmls <- paste0(data$university_primary_key, '.html')
+
+# Create Df
+uni_data <- lapply(htmls, get_university_data)
+uni_data_appended <- data.frame(rbindlist(uni_data))
+
+# Inner join
+data_raw <- inner_join(data, uni_data_appended, by = "university_primary_key")
+
+
+# Save dataset for future use
+saveRDS(data_raw, file = "raw/university_raw.rds")
+
+# Delete objects
+rm(list = c('uni_data','uni_data_appended', 'htmls', 'get_university_data'))
+
+
+```
+
+
+Let's take a look at the raw dataset:
+```{r, echo = F, error = F, warning = F, messages = F}
+
+kable(head(data_raw %>% select(-description, -admission_description))) %>%
+  kable_styling(font_size = 11, full_width = F) %>%
+  scroll_box(width = "900px")
+
+
+```
+
+
+
+
+## Data cleaning
+
+The next step was that the scraped data needed to go through several data cleaning steps.
+The major data cleaning steps were the following:
+
+* University website URLs needed to be cleaned from unnecessary slashes.
+* The previously described in-state and out-of-state tuition fees needed to be split into two variables. Note that in case of public universities tuition = tuition_in_state.
+* All fields in USD needed to be cleaned from the $ character and converted to numeric.
+* All fields in percentage needed to be cleaned from the % character and converted to numeric.
+* All NA values had to be converted to standard missing coding.
+* A grouped school type variable was created for further visualizations.
+
+
+```{r, error = F, warning = F, messages = F}
+
+# Define new dataframe for clean dataset
+data_clean <- data_raw
+
+# University rank
+data_clean$university_rank <- gsub("#", "", data_clean$university_rank) # Remove hashtag from ranking
+# Tuition fee
+data_clean$tuition_in_out_of_state <- gsub("[][',$]", "", data_clean$tuition_in_out_of_state) # Remove $ and comma
+data_clean <- data_clean %>% separate(tuition_in_out_of_state, c("tuition_out_of_state","tuition_in_state"), sep = "([ ])") # Separate in and out of state tuition fee
+data_clean$tuition_in_state <- as.numeric(data_clean$tuition_in_state)
+data_clean$tuition_out_of_state <- as.numeric(data_clean$tuition_out_of_state)
+# School type
+data_clean$school_type <- gsub("N/A", NA, data_clean$school_type) # Replace NA
+# Year founded
+data_clean$year_founded <- gsub("N/A", NA, data_clean$year_founded) # Replace NA
+# Academic calendar
+data_clean$academic_calendar <- gsub("N/A", NA, data_clean$academic_calendar) # Replace NA
+# Phone
+data_clean$phone <- gsub("N/A", NA, data_clean$phone) # Replace NA
+# School_website
+data_clean$school_website <- trimws(data_clean$school_website, "left", '//') # Remove leading //
+data_clean$school_website <- trimws(data_clean$school_website, "right", '/') # Remove ending /
+# Medium starting salary
+data_clean$median_starting_salary <- as.numeric(ifelse(data_clean$median_starting_salary %in% c('Median starting salary of alumni', 'N/A'), NA, gsub("[]['$,]", "", data_clean$median_starting_salary))) # Replace incorrect records and NA
+# Acceptance rate
+data_clean$acceptance_rate <- as.numeric(ifelse(data_clean$acceptance_rate %in% c('N/A'), NA, gsub("[]['%]", "", data_clean$acceptance_rate)))/100 # Replace NA, remove % and divide by 100
+# Class size
+data_clean$class_size_20 <- as.numeric(ifelse(data_clean$class_size_20 %in% c('N/A'), NA, gsub("[]['%]", "", data_clean$class_size_20)))/100 # Replace NA, remove % and divide by 100
+data_clean$class_size_20_49 <- as.numeric(ifelse(data_clean$class_size_20_49 %in% c('N/A'), NA, gsub("[]['%]", "", data_clean$class_size_20_49)))/100 
+data_clean$class_size_50 <- as.numeric(ifelse(data_clean$class_size_50 %in% c('N/A'), NA, gsub("[]['%]", "", data_clean$class_size_50)))/100 
+# Graduation rate
+data_clean$graduation_rate <- as.numeric(ifelse(data_clean$graduation_rate %in% c('N/A'), NA, gsub("[]['%]", "", data_clean$graduation_rate)))/100 # Replace NA, remove % and divide by 100
+# Gender rates
+data_clean$male <- as.numeric(ifelse(data_clean$male %in% c('N/A'), NA, gsub("[]['%]", "", data_clean$male)))/100 # Remove % and divide by 100
+data_clean$female <- as.numeric(ifelse(data_clean$female %in% c('N/A'), NA, gsub("[]['%]", "", data_clean$female)))/100
+# Create grouped field for school type
+data_clean <- data_clean %>% mutate( school_type_group = case_when(
+  school_type %in% c('Private, Coed', "Private, Women\'s college", "Private") ~ 'Private',
+  school_type %in% c('Public, Coed', 'Public') ~ 'Public',
+  school_type %in% c('Proprietary, Coed', 'Proprietary') ~ 'Proprietary')
+  )
+
+
+# Save dataset for future use
+saveRDS(data_clean, file = "clean/university_clean.rds")
+
+
+```
+
+
+Let's take a look at the clean dataset:
+```{r, echo = F, error = F, warning = F, messages = F}
+
+kable(head(data_clean %>% select(-description, -admission_description))) %>%
+  kable_styling(font_size = 11, full_width = F) %>%
+  scroll_box(width = "900px")
+
+```
+
+
+
+## Data visualization
+
+Finally, we have a clean dataset that we can analyze.
+
+### Top ranking universities
+
+First, let's take a look at the private and public universities with the highest ranking and their undergraduate enrollment. 
+
+```{r, error = F, warning = F, messages = F, echo = F, fig.align='center', fig.height=4, fig.width=11}
+
+# Viz1: Top Private universities
+p1 <- data_clean %>% 
+  filter(nchar(university_rank) <=2 & school_type_group == 'Private') %>% 
+  mutate( university_rank = as.numeric(university_rank) ) %>% 
+  arrange(university_rank) %>% 
+  head(20) %>% 
+  ggplot() +
+  aes(x = reorder(university_name, -university_rank), y=undergrad_enrollment) +
+  geom_bar(stat="identity",  fill ="#2ca25f")   +
+  labs(title = "Enrollment in top private universities", y = "Enrollment", x = "") +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 11L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+p2 <- data_clean %>% 
+  filter(nchar(university_rank) <=2  & school_type_group == 'Public') %>% 
+  mutate( university_rank = as.numeric(university_rank) ) %>% 
+  arrange(university_rank) %>% 
+  head(20) %>% 
+  ggplot() +
+  aes(x = reorder(university_name, -university_rank), y=undergrad_enrollment) +
+  geom_bar(stat="identity", fill ="#2c7fb8")   +
+  labs(title = "Enrollment in top public universities", y = "Enrollment", x = "") +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 11L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+plot_grid(p1, p2, align = "h", ncol = 2, rel_widths = c(1,1))
+
+```
+
+Note that multiple universities can have the same ranking, hence the first 20 universities were selected based on their rank. Princeton leads the private university list, followed by the MIT, Harvard and the Columbia University that are all on the second place in the ranking. We can see that the typical number of undergraduate students move between 5000 and 7000 in the private universities, while 2 to 5 times more students study at public universities. Caltech has extremely low number of undergraduate enrollment with only 901 students, and among the private schools the William & Mary University has about the same number of students that of a typical private university. 
+
+
+### Tuition fees by university type
+
+Let's move to the finances. The following three charts compare the distribution of the tuition fees of the institutions by university and financing type. As described earlier, public universities offer both out-of-state and in-state financing schemes that are shown separately in the charts.
+
+```{r, error = F, warning = F, messages = F, echo = F, fig.align='center', fig.height=6, fig.width=11}
+
+
+# Viz3: Tuition fees of private universities
+avg_tuition <- as.numeric( data_clean %>% filter( school_type_group == 'Private') %>% summarize( avg_tuition = mean(tuition, na.rm=T)) )
+p1 <- data_clean %>% 
+  filter( school_type_group == 'Private') %>% 
+  ggplot() +
+  aes(x = tuition, y=..count../sum(count)) +
+  geom_histogram(bins = 30L, fill ="#2ca25f") +
+  geom_vline(xintercept = avg_tuition, linetype="dashed", color = "gray20", size=1) +
+  labs(title = "Private schools", y = "Frequency", x = "Tuition") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 5L)) +
+  xlim(0, 70000) + 
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+# Viz4: Tuition fees of public universities with out-of-state financing
+avg_tuition_out_of_state <- as.numeric( data_clean %>% filter( school_type_group == 'Public') %>% summarize( avg_tuition_out_of_state = mean(tuition_out_of_state, na.rm=T)) )
+p2 <- data_clean %>% 
+  filter( school_type_group == 'Public') %>% 
+  ggplot() +
+  aes(x = tuition_out_of_state, y=..count../sum(count)) +
+  geom_histogram(bins = 30L, fill = "#2c7fb8") +
+  geom_vline(xintercept = avg_tuition_out_of_state, linetype="dashed", color = "gray20", size=1) +
+  xlim(0, 70000) + 
+  labs(title = "Public schools - Out-of-State", y = "Frequency", x = "Tuition") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 5L)) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+# Viz5: Tuition fees of public universities with in-state financing
+avg_tuition_in_state <- as.numeric( data_clean %>% filter( school_type_group == 'Public') %>% summarize( avg_tuition_in_state = mean(tuition_in_state , na.rm=T)) )
+p3 <- data_clean %>% 
+  filter( school_type_group == 'Public') %>% 
+  ggplot() +
+  aes(x = tuition_in_state, y=..count../sum(count)) +
+  geom_histogram(bins = 30L, fill = "#41b6c4") +
+  geom_vline(xintercept = avg_tuition_in_state, linetype="dashed", color = "gray20", size=1) +
+  labs(title = "Public schools - In-State", y = "Frequency", x = "Tuition") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 5L)) +
+  xlim(0, 40000) + 
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+
+
+grid.arrange(p1,p2,p3, ncol=3)
+
+  
+```
+
+Private universities have an average tuition fee of about 40.000 USD, almost 4 times higher than the average cost that students who study in state-financed public universities have to pay. We can also see that the distributions are unimodal and raughly symmetric in case of the public universities, while private universities have two modes at about 30.000 USD and 60.000 USD. 
+
+
+### Top most expensive private schools
+
+Let's take a closer look at the most expansive universities. The next charts show the top 20 private and public universities with the highest tuition fees. I highlighted the universities with the 5 highest ranking in case of both school types.
+
+```{r, error = F, warning = F, messages = F, echo = F, fig.align='center', fig.height=4, fig.width=11}
+
+p1 <- data_clean %>% 
+  filter( school_type_group == 'Private') %>% 
+  mutate(university_rank_top3 = as.factor(case_when(
+    university_rank %in% c(1,2,5) ~ 1, # There are 3 schools at the 2nd place
+    TRUE ~ 0))) %>% 
+  arrange(-tuition) %>% 
+  head(20) %>% 
+  ggplot() +
+  aes(x = reorder(university_name, tuition), y=tuition, fill = university_rank_top3) +
+  geom_bar(stat="identity")   +
+  labs(title = "Most expensive private schools", y = "Tuition", x = "") +
+  scale_fill_manual( values = c( "#2ca25f", "#006d2c")) +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+p2 <- data_clean %>% 
+  filter( school_type_group == 'Public') %>% 
+  mutate(university_rank_top3 = as.factor(case_when(
+    university_rank %in% c(20,22,23,25,28) ~ 1, # The rank values were checked in advance
+    TRUE ~ 0))) %>% 
+  arrange(-tuition) %>% 
+  head(20) %>% 
+  ggplot() +
+  aes(x = reorder(university_name, tuition_out_of_state), fill = university_rank_top3 , y=tuition_out_of_state) +
+  geom_bar(stat="identity")   +
+  labs(title = "Most expensive public schools", y = "Tuition", x = "") +
+  scale_fill_manual( values = c( "#2c7fb8", "#045a8d")) +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+
+
+
+plot_grid(p1, p2, align = "h", ncol = 2, rel_widths = c(0.9,1))
+
+
+```
+
+In case of the private universities it seems that the most expensive universities are not necessary the ones with the highest rankings. For example, Princeton University, which is the leading on the university ranking list is not even among the top 20 most expensive private universities with its 56.010 USD tuition fee. However, private universities apply very similar tuition fees so they are most probably not on the list because of the small difference in the tuition fees. In case of the public schools, on the other hand, it seems that the best universities are the most expansive ones.
+
+### Relationship between the tuition fee and the median starting salary
+
+The next two charts show the relationship between the the tuition fee and the median starting salary.
+
+```{r, error = F, warning = F, messages = F, echo = F, fig.align='center', fig.height=4, fig.width=11}
+
+# Relationship between the tuition fee and the median starting salary
+p1 <- data_clean %>%  
+  filter(school_type_group %in% c('Private')) %>% 
+  ggplot() %>% +
+  aes(x = tuition, y = median_starting_salary) +
+  labs(title = "Private universities", y = "Median starting salary", x = "Tuition") +
+  geom_point(shape = "circle", size = 1.5, 
+             colour = "#112446") +
+  geom_smooth( se = F) +
+  xlim(c(0,60000)) +
+  ylim(c(30000,90000)) +
+  theme_bw() +
+    theme(
+    plot.title = element_text(size = 11L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+
+p2 <- data_clean %>%  
+  filter(school_type_group %in% c('Public')) %>% 
+  ggplot() %>% +
+  aes(x = tuition_out_of_state, y = median_starting_salary) +
+  labs(title = "Public universities", y = "Median starting salary", x = "Tuition") +
+  geom_point(shape = "circle", size = 1.5, 
+             colour = "#112446") +
+  geom_smooth( se = F) +
+  xlim(c(0,60000)) +
+  ylim(c(30000,90000)) +
+  theme_bw() +
+    theme(
+    plot.title = element_text(size = 11L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+
+p3 <- data_clean %>%  
+  filter(school_type_group %in% c('Public')) %>% 
+  ggplot() %>% +
+  aes(x = tuition_in_state, y = median_starting_salary) +
+  labs(title = "Tuition fee and the median starting salary", y = "Median starting salary", x = "Tuition") +
+  geom_point(shape = "circle", size = 1.5, 
+             colour = "#112446") +
+  geom_smooth(method='lm', formula= y~x, se = F) +
+  theme_bw() +
+    theme(
+    plot.title = element_text(size = 11L,
+    face = "bold", hjust = 0.5),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "none"
+ )
+
+
+grid.arrange(p1,p2, ncol=2)
+
+```
+
+The loess fits imply that in case of the private schools the pattern of association is rather exponential, while in case of the public schools it is seemingly linear.  Does it imply that if we pay more for the tuition than we can expect higher salaries in the future? Most probably not, as it rather shows the relationship between the salary and the quality of education, which is obviously higher at more expensive universities, and also the abilities of the students who are admitted to those universities. 
+
+
+### Top male and female dominated universities
+
+Finally, let's check which are the universities where the gender distribution is highly imbalanced.
+
+```{r, error = F, warning = F, messages = F, echo = F, fig.align='center', fig.height=4, fig.width=11}
+
+# Viz1 : Male dominated universities
+p1 <- data_clean %>%   
+  arrange(desc(male)) %>%
+  head(10)  %>%
+  mutate(rank = dense_rank(desc(male))) %>%
+  select(rank, university_name, female, male) %>% 
+  gather( `female`,`male` ,  key= gender , value = ratio ) %>% 
+  ggplot(aes(x = reorder(university_name, -rank), y = ratio, fill = gender)) +
+  geom_bar(stat="identity")   +
+  coord_flip() +
+  labs(title = "Top 10 male dominated universities", y = "Gender distribution", x = "", fill = "") +
+  scale_fill_manual(labels = c("Female", "Male"), values = c("#2c7fb8", "#2ca25f")) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 12L,
+                              face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+
+# Viz2 : Feale dominated universities
+p2 <- data_clean %>%   
+  arrange(desc(female)) %>%
+  head(10)  %>%
+  mutate(rank = dense_rank(desc(female))) %>%
+  select(rank, university_name, female, male) %>% 
+  gather( `female`,`male` ,  key= gender , value = ratio ) %>% 
+  mutate(gender = relevel(factor(gender), 'male'))  %>% 
+  ggplot(aes(x = reorder(university_name, -rank), y = ratio, fill = gender)) +
+  geom_bar(stat="identity")   +
+  coord_flip() +
+  labs(title = "Top 10 female dominated universities", y = "Gender distribution", x = "", fill = "") +
+  scale_fill_manual(labels = c("Male", "Female"), values = c( "#2ca25f", "#2c7fb8")) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 12L,
+                              face = "bold"),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+
+plot_grid(p1, p2, align = "h", ncol = 2, rel_widths = c(1,0.8))
+
+```
+
+Not surprisingly, in case of the male dominated universities the majority are universities of technology with 70 and higher male student rate. If we look at the female dominated universities we can see that the Simmons University, which is a private women's collage, is obviously the leading with having 100% female students. 
+
+
+
+
+
